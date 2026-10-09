@@ -1,0 +1,28 @@
+{
+  "name": "livebridge",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0 --port 3000",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0 --port 3000",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@decartai/sdk": "0.2.8",
+    "@mantine/core": "9.7.1",
+    "@mantine/dropzone": "9.7.1",
+    "@mantine/hooks": "9.7.1",
+    "@tabler/icons-react": "3.49.0",
+    "next": "16.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "typescript": "7.0.2"
+  }
+}

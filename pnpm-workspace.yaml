@@ -1,0 +1,8 @@
+packages: []
+
+allowBuilds:
+  esbuild: true
+  next: true
+
+minimumReleaseAgeExclude:
+  - '@decartai/sdk@0.2.8'
