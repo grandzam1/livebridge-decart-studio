@@ -14,6 +14,7 @@ export function ObsViewer() {
   useEffect(() => {
     let disposed = false;
     let disconnectSubscriber: (() => void) | null = null;
+    const abortController = new AbortController();
 
     const connect = async () => {
       const params = new URLSearchParams(window.location.hash.slice(1));
@@ -31,8 +32,11 @@ export function ObsViewer() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model }),
           cache: "no-store",
+          signal: abortController.signal,
         });
+        if (disposed) return;
         const tokenPayload = await tokenResponse.json() as { clientToken?: string; error?: string };
+        if (disposed) return;
         if (!tokenResponse.ok || !tokenPayload.clientToken) {
           throw new Error(tokenPayload.error ?? "The OBS viewer could not get a Decart connection token.");
         }
@@ -50,6 +54,10 @@ export function ObsViewer() {
             });
           },
         });
+        if (disposed) {
+          subscriber.disconnect();
+          return;
+        }
         disconnectSubscriber = () => subscriber.disconnect();
         subscriber.on("connectionChange", (state) => {
           if (disposed) return;
@@ -76,6 +84,7 @@ export function ObsViewer() {
     void connect();
     return () => {
       disposed = true;
+      abortController.abort();
       disconnectSubscriber?.();
       if (videoRef.current) videoRef.current.srcObject = null;
     };

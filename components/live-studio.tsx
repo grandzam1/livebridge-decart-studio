@@ -13,6 +13,7 @@ import {
   CopyButton,
   Divider,
   Group,
+  Loader,
   Paper,
   Select,
   SegmentedControl,
@@ -41,6 +42,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { REALTIME_MODES, modelForMode, type RealtimeMode, type RealtimeModelName } from "@/lib/decart";
 
 type SessionState = "idle" | "connecting" | "connected" | "generating" | "reconnecting" | "disconnected" | "error";
+type ServerSetupStatus = { configured: boolean; missing: string[] };
 
 function formatDuration(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -68,6 +70,9 @@ export function LiveStudio() {
   const outputVideoRef = useRef<HTMLVideoElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const realtimeRef = useRef<RealTimeClient | null>(null);
+  const mountedRef = useRef(false);
+  const startGenerationRef = useRef(0);
+  const startAbortRef = useRef<AbortController | null>(null);
   const [mode, setMode] = useState<RealtimeMode>("character");
   const [cameraId, setCameraId] = useState<string | null>(null);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
@@ -80,16 +85,35 @@ export function LiveStudio() {
   const [obsUrl, setObsUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [referenceBusy, setReferenceBusy] = useState(false);
+  const [serverStatus, setServerStatus] = useState<ServerSetupStatus | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/config/status", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Configuration status unavailable");
+        return await response.json() as ServerSetupStatus;
+      })
+      .then((status) => {
+        if (active) setServerStatus(status);
+      })
+      .catch(() => {
+        if (active) setServerStatus({ configured: false, missing: ["server configuration status"] });
+      });
+    return () => { active = false; };
+  }, []);
 
   const refreshCameras = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
+      if (!mountedRef.current) return;
       const videoInputs = devices.filter((device) => device.kind === "videoinput");
       setCameras(videoInputs);
       setCameraId((current) => current && videoInputs.some((device) => device.deviceId === current) ? current : videoInputs[0]?.deviceId ?? null);
     } catch {
-      setError("Camera devices could not be listed. Check browser permissions and reload.");
+      if (mountedRef.current) setError("Camera devices could not be listed. Check browser permissions and reload.");
     }
   }, []);
 
@@ -105,9 +129,20 @@ export function LiveStudio() {
     return () => window.clearInterval(timer);
   }, [sessionState]);
 
-  useEffect(() => () => {
-    realtimeRef.current?.disconnect();
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      startGenerationRef.current += 1;
+      startAbortRef.current?.abort();
+      startAbortRef.current = null;
+      const session = realtimeRef.current;
+      realtimeRef.current = null;
+      session?.disconnect();
+      const media = localStreamRef.current;
+      localStreamRef.current = null;
+      media?.getTracks().forEach((track) => track.stop());
+    };
   }, []);
 
   useEffect(() => {
@@ -123,10 +158,15 @@ export function LiveStudio() {
   }, []);
 
   const stopSession = useCallback(() => {
-    realtimeRef.current?.disconnect();
+    startGenerationRef.current += 1;
+    startAbortRef.current?.abort();
+    startAbortRef.current = null;
+    const session = realtimeRef.current;
     realtimeRef.current = null;
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    session?.disconnect();
+    const media = localStreamRef.current;
     localStreamRef.current = null;
+    media?.getTracks().forEach((track) => track.stop());
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
     if (outputVideoRef.current) outputVideoRef.current.srcObject = null;
     setSessionState("idle");
@@ -137,6 +177,22 @@ export function LiveStudio() {
 
   const startSession = useCallback(async () => {
     if (busy || sessionState === "connected" || sessionState === "connecting") return;
+    if (!serverStatus?.configured) {
+      setError("Add DECART_API_KEY and APP_ORIGINS to the server environment before starting a live session.");
+      return;
+    }
+    if (!mountedRef.current) return;
+
+    const attemptId = ++startGenerationRef.current;
+    const abortController = new AbortController();
+    startAbortRef.current = abortController;
+    const isCurrentAttempt = () => mountedRef.current && startGenerationRef.current === attemptId;
+    const disposePendingMedia = (media: MediaStream) => {
+      media.getTracks().forEach((track) => track.stop());
+      if (localStreamRef.current === media) localStreamRef.current = null;
+      if (localVideoRef.current?.srcObject === media) localVideoRef.current.srcObject = null;
+    };
+
     setBusy(true);
     setError(null);
     setSessionState("connecting");
@@ -153,20 +209,37 @@ export function LiveStudio() {
         },
         audio: microphoneOn,
       });
+      if (!isCurrentAttempt()) {
+        disposePendingMedia(media);
+        return;
+      }
       localStreamRef.current = media;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = media;
         void localVideoRef.current.play().catch(() => undefined);
       }
       await refreshCameras();
+      if (!isCurrentAttempt()) {
+        disposePendingMedia(media);
+        return;
+      }
 
       const tokenResponse = await fetch("/api/realtime-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: modelName }),
         cache: "no-store",
+        signal: abortController.signal,
       });
+      if (!isCurrentAttempt()) {
+        disposePendingMedia(media);
+        return;
+      }
       const tokenPayload = await tokenResponse.json() as { clientToken?: string; error?: string };
+      if (!isCurrentAttempt()) {
+        disposePendingMedia(media);
+        return;
+      }
       if (!tokenResponse.ok || !tokenPayload.clientToken) {
         throw new Error(tokenPayload.error ?? "Could not get a short-lived Decart session token.");
       }
@@ -179,6 +252,11 @@ export function LiveStudio() {
         onRemoteStream: attachOutput,
         ...(reference ? { initialState: { image: reference } } : {}),
       });
+      if (!isCurrentAttempt()) {
+        realtime.disconnect();
+        disposePendingMedia(media);
+        return;
+      }
       realtimeRef.current = realtime;
       setSessionState(realtime.getConnectionState() as SessionState);
       setSessionSeconds(0);
@@ -189,64 +267,86 @@ export function LiveStudio() {
       };
       syncViewerLink();
       realtime.on("connectionChange", (state) => {
+        if (!mountedRef.current || realtimeRef.current !== realtime) return;
+        if (state === "disconnected") {
+          stopSession();
+          setSessionState("error");
+          setError("The Decart session disconnected. Start a new session to reconnect.");
+          return;
+        }
         setSessionState(state as SessionState);
         syncViewerLink();
       });
-      realtime.on("generationTick", ({ seconds }) => setSessionSeconds(seconds));
+      realtime.on("generationTick", ({ seconds }) => {
+        if (mountedRef.current && realtimeRef.current === realtime) setSessionSeconds(seconds);
+      });
       realtime.on("error", (sdkError) => {
+        if (!mountedRef.current || realtimeRef.current !== realtime) return;
+        stopSession();
+        setSessionState("error");
         setError(sdkError.message || "The Decart session reported an error.");
       });
+      realtime.on("sessionEnded", () => {
+        if (!mountedRef.current || realtimeRef.current !== realtime) return;
+        stopSession();
+        setSessionState("error");
+        setError("Decart ended this session. Start a new session to reconnect.");
+      });
     } catch (caught) {
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
-      if (localVideoRef.current) localVideoRef.current.srcObject = null;
+      if (!isCurrentAttempt()) return;
+      stopSession();
+      if (!mountedRef.current) return;
       setSessionState("error");
       setError(caught instanceof Error ? caught.message : "Unable to start the live session.");
     } finally {
-      setBusy(false);
+      if (startAbortRef.current === abortController) startAbortRef.current = null;
+      if (mountedRef.current) setBusy(false);
     }
-  }, [attachOutput, busy, cameraId, mode, microphoneOn, refreshCameras, reference, sessionState]);
+  }, [attachOutput, busy, cameraId, mode, microphoneOn, refreshCameras, reference, serverStatus, sessionState, stopSession]);
 
   const applyReference = async () => {
-    if (!reference) return;
+    if (!reference || referenceBusy) return;
+    setReferenceBusy(true);
     setError(null);
     try {
-      if (realtimeRef.current) await realtimeRef.current.setImage(reference);
-      setReferenceApplied(true);
+      const session = realtimeRef.current;
+      if (session) {
+        await session.setImage(reference);
+        if (mountedRef.current && realtimeRef.current === session) setReferenceApplied(true);
+      }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The reference image could not be applied.");
+      if (mountedRef.current) setError(caught instanceof Error ? caught.message : "The reference image could not be applied.");
+    } finally {
+      if (mountedRef.current) setReferenceBusy(false);
     }
   };
 
   const clearReference = async () => {
+    if (referenceBusy) return;
+    setReferenceBusy(true);
     setError(null);
     try {
       if (realtimeRef.current) await realtimeRef.current.setImage(null);
+      if (!mountedRef.current) return;
       if (referenceUrl) URL.revokeObjectURL(referenceUrl);
       setReference(null);
       setReferenceUrl(null);
       setReferenceApplied(false);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The live reference could not be cleared.");
+      if (mountedRef.current) setError(caught instanceof Error ? caught.message : "The live reference could not be cleared.");
+    } finally {
+      if (mountedRef.current) setReferenceBusy(false);
     }
   };
 
-  const onDrop = async (files: File[]) => {
+  const onDrop = (files: File[]) => {
     const file = files[0];
-    if (!file) return;
+    if (!file || referenceBusy || busy) return;
     if (referenceUrl) URL.revokeObjectURL(referenceUrl);
     setReference(file);
     setReferenceUrl(URL.createObjectURL(file));
     setReferenceApplied(false);
     setError(null);
-    if (realtimeRef.current) {
-      try {
-        await realtimeRef.current.setImage(file);
-        setReferenceApplied(true);
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : "The replacement image could not be applied.");
-      }
-    }
   };
 
   const connected = sessionState === "connected" || sessionState === "generating" || sessionState === "reconnecting";
@@ -268,8 +368,8 @@ export function LiveStudio() {
         </Group>
         <Group gap="md" className="header-meta">
           <Text size="xs" c="dimmed" className="desktop-only">Your camera stays in your control</Text>
-          <Badge color={connected ? "teal" : sessionState === "error" ? "red" : "gray"} variant="light" leftSection={<span className={`status-led ${connected ? "is-live" : ""}`} />}>
-            {connected ? "Live" : sessionState === "connecting" ? "Connecting" : sessionState === "error" ? "Needs attention" : "Ready"}
+          <Badge color={!serverStatus ? "gray" : !serverStatus.configured ? "yellow" : connected ? "teal" : sessionState === "error" ? "red" : "gray"} variant="light" leftSection={<span className={`status-led ${connected ? "is-live" : ""}`} />}>
+            {!serverStatus ? "Checking setup" : !serverStatus.configured ? "Setup required" : connected ? "Live" : sessionState === "connecting" ? "Connecting" : sessionState === "error" ? "Needs attention" : "Ready"}
           </Badge>
         </Group>
       </AppShell.Header>
@@ -282,6 +382,12 @@ export function LiveStudio() {
             </Box>
             <Badge variant="outline" color="gray" leftSection={<IconAperture size={13} />}>Decart-hosted inference</Badge>
           </Group>
+
+          {serverStatus && !serverStatus.configured && (
+            <Alert mb="md" color="yellow" variant="light" title="Server setup needed" icon={<IconX size={16} />}>
+              Add {serverStatus.missing.join(" and ")} to the server environment. The studio remains available, but live start is disabled until setup is complete.
+            </Alert>
+          )}
 
           {error && (
             <Alert mb="md" color="red" variant="light" title="Something needs attention" icon={<IconX size={16} />}>
@@ -337,8 +443,8 @@ export function LiveStudio() {
                   </Group>
                   <Group gap="xs">
                     {!connected ? (
-                      <Button leftSection={busy ? <IconRefresh size={16} /> : <IconPlayerPlay size={16} />} onClick={() => void startSession()} loading={busy} color="teal" size="sm">
-                        Start live
+                      <Button leftSection={busy ? <IconRefresh size={16} /> : <IconPlayerPlay size={16} />} onClick={() => void startSession()} loading={busy} disabled={!serverStatus?.configured || referenceBusy} color="teal" size="sm">
+                        {!serverStatus ? "Checking setup" : serverStatus.configured ? "Start live" : "Setup required"}
                       </Button>
                     ) : (
                       <Button leftSection={<IconPlayerStop size={16} />} onClick={stopSession} color="red" variant="light" size="sm">
@@ -382,6 +488,7 @@ export function LiveStudio() {
                   <Dropzone
                     onDrop={onDrop}
                     onReject={() => setError("Choose a supported image file up to 10 MB.")}
+                    disabled={referenceBusy || busy}
                     accept={IMAGE_MIME_TYPE}
                     maxSize={10 * 1024 * 1024}
                     maxFiles={1}
@@ -411,6 +518,7 @@ export function LiveStudio() {
                       <Dropzone
                         onDrop={onDrop}
                         onReject={() => setError("That image could not be used. Choose a supported image up to 10 MB.")}
+                        disabled={referenceBusy || busy}
                         accept={IMAGE_MIME_TYPE}
                         maxSize={10 * 1024 * 1024}
                         maxFiles={1}
@@ -418,20 +526,26 @@ export function LiveStudio() {
                         activateOnClick
                         style={{ border: 0, padding: 0, background: "transparent" }}
                       >
-                        <Button component="span" size="xs" variant="default" leftSection={<IconRefresh size={14} />}>Replace</Button>
+                        <Button component="span" size="xs" variant="default" leftSection={<IconRefresh size={14} />} disabled={referenceBusy || busy}>Replace</Button>
                       </Dropzone>
-                      <Button size="xs" variant="light" color="teal" onClick={() => void applyReference()} disabled={referenceApplied}>
-                        {connected ? "Apply to live" : "Use next session"}
-                      </Button>
+                      {connected ? (
+                        <Button size="xs" variant="light" color="teal" onClick={() => void applyReference()} loading={referenceBusy} disabled={referenceApplied || referenceBusy}>
+                          {referenceApplied ? "Applied" : "Apply to live"}
+                        </Button>
+                      ) : (
+                        <Badge color="gray" variant="light">Ready for next session</Badge>
+                      )}
                       <Tooltip label="Clear selected image">
-                        <ActionIcon aria-label="Clear reference image" size="sm" variant="subtle" color="red" onClick={() => void clearReference()}>
-                          <IconX size={15} />
+                        <ActionIcon aria-label="Clear reference image" size="sm" variant="subtle" color="red" onClick={() => void clearReference()} disabled={referenceBusy || busy}>
+                          {referenceBusy ? <Loader size={14} /> : <IconX size={15} />}
                         </ActionIcon>
                       </Tooltip>
                     </Group>
                   </Stack>
                 )}
-                <Text className="panel-kicker" mt="sm">The image is sent to Decart only when the live session starts or you apply it.</Text>
+                <Text className="panel-kicker" mt="sm">
+                  {referenceBusy ? "Updating the live reference…" : connected ? referenceApplied ? "This image is guiding the active session." : "Preview the replacement, then apply it to change the live look." : "The selected image is sent only when the next live session starts."}
+                </Text>
               </Paper>
 
               <Paper className="panel" radius="lg" p="md">
@@ -472,10 +586,10 @@ export function LiveStudio() {
                     <span className={`status-led ${connected ? "is-live" : ""}`} />
                     <Box>
                       <Text className="panel-title">Session status</Text>
-                      <Text className="panel-kicker" mt={3}>{connected ? `Connected · ${formatDuration(sessionSeconds)}` : sessionState === "connecting" ? "Requesting camera and connecting…" : sessionState === "error" ? "Connection needs attention" : "Not connected"}</Text>
+                      <Text className="panel-kicker" mt={3}>{connected ? `Connected · ${formatDuration(sessionSeconds)}` : !serverStatus ? "Checking server setup…" : !serverStatus.configured ? "Server setup required before connecting" : sessionState === "connecting" ? "Requesting camera and connecting…" : sessionState === "error" ? "Connection needs attention" : "Not connected"}</Text>
                     </Box>
                   </Group>
-                  <Text className="mono-meta">{connected ? "LIVE" : "READY"}</Text>
+                  <Text className="mono-meta">{connected ? "LIVE" : !serverStatus ? "CHECKING" : serverStatus.configured ? "READY" : "SETUP"}</Text>
                 </Group>
               </Paper>
             </div>
