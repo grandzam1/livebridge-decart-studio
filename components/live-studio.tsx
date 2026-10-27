@@ -30,7 +30,9 @@ import {
   IconCheck,
   IconCopy,
   IconExternalLink,
+  IconLayoutColumns,
   IconPhoto,
+  IconPictureInPicture,
   IconPlayerPlay,
   IconPlayerStop,
   IconRefresh,
@@ -40,9 +42,30 @@ import {
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { REALTIME_MODES, modelForMode, type RealtimeMode, type RealtimeModelName } from "@/lib/decart";
+import { connectFalLucySession, type FalLucySession } from "@/lib/fal-lucy-session";
+import type { LiveProvider } from "@/lib/live-provider";
 
 type SessionState = "idle" | "connecting" | "connected" | "generating" | "reconnecting" | "disconnected" | "error";
-type ServerSetupStatus = { configured: boolean; missing: string[] };
+type ServerSetupStatus = { configured: boolean; missing: string[]; provider?: LiveProvider };
+
+const REFERENCE_MAX_BYTES = 10 * 1024 * 1024;
+const ACCEPTED_IMAGE_TYPES = new Set<string>(IMAGE_MIME_TYPE);
+
+function imageFileFromClipboard(data: DataTransfer | null) {
+  if (!data) return null;
+  const listed = Array.from(data.files).find((file) => file.type.startsWith("image/"));
+  if (listed) return listed;
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) return file;
+  }
+  return null;
+}
+
+function isTextEntry(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
 
 function formatDuration(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -50,9 +73,8 @@ function formatDuration(totalSeconds: number) {
   return `${minutes}:${seconds}`;
 }
 
-function buildViewerUrl(token: string, model: RealtimeModelName) {
-  const fragment = new URLSearchParams({ token, model });
-  return `${window.location.origin}/obs#${fragment.toString()}`;
+function viewerUrl(viewKey: string) {
+  return `${window.location.origin}/obs?key=${encodeURIComponent(viewKey)}`;
 }
 
 function VideoPlaceholder({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
@@ -70,9 +92,13 @@ export function LiveStudio() {
   const outputVideoRef = useRef<HTMLVideoElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const realtimeRef = useRef<RealTimeClient | null>(null);
+  const falSessionRef = useRef<FalLucySession | null>(null);
   const mountedRef = useRef(false);
   const startGenerationRef = useRef(0);
   const startAbortRef = useRef<AbortController | null>(null);
+  const obsSessionIdRef = useRef<string | null>(null);
+  const obsModelRef = useRef<RealtimeModelName | null>(null);
+  const clearPublishedSessionRef = useRef<() => void>(() => undefined);
   const [mode, setMode] = useState<RealtimeMode>("character");
   const [cameraId, setCameraId] = useState<string | null>(null);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
@@ -86,6 +112,7 @@ export function LiveStudio() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [referenceBusy, setReferenceBusy] = useState(false);
+  const [pipLayout, setPipLayout] = useState(false);
   const [serverStatus, setServerStatus] = useState<ServerSetupStatus | null>(null);
 
   useEffect(() => {
@@ -100,6 +127,63 @@ export function LiveStudio() {
       })
       .catch(() => {
         if (active) setServerStatus({ configured: false, missing: ["server configuration status"] });
+      });
+    return () => { active = false; };
+  }, []);
+
+  const publishObsSession = useCallback(async (sessionId: string, subscribeToken: string | null, model: RealtimeModelName | null) => {
+    try {
+      const response = await fetch("/api/obs/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, subscribeToken, model }),
+        cache: "no-store",
+        keepalive: true,
+      });
+      return response.ok || response.status === 204;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  clearPublishedSessionRef.current = () => {
+    const sessionId = obsSessionIdRef.current;
+    obsSessionIdRef.current = null;
+    obsModelRef.current = null;
+    if (!sessionId) return;
+    void publishObsSession(sessionId, null, null);
+  };
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const sessionId = obsSessionIdRef.current;
+      const modelName = obsModelRef.current;
+      const session = realtimeRef.current;
+      const subscribeToken = session?.subscribeToken;
+      if (!sessionId || !modelName || !subscribeToken || !session.isConnected()) return;
+      void publishObsSession(sessionId, subscribeToken, modelName);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [publishObsSession]);
+
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/obs/link", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "read" }),
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("OBS link unavailable");
+        return await response.json() as { viewKey?: string };
+      })
+      .then((payload) => {
+        if (!active || !payload.viewKey) return;
+        setObsUrl(viewerUrl(payload.viewKey));
+      })
+      .catch(() => {
+        if (active) setObsUrl(null);
       });
     return () => { active = false; };
   }, []);
@@ -136,9 +220,13 @@ export function LiveStudio() {
       startGenerationRef.current += 1;
       startAbortRef.current?.abort();
       startAbortRef.current = null;
+      clearPublishedSessionRef.current();
       const session = realtimeRef.current;
       realtimeRef.current = null;
       session?.disconnect();
+      const falSession = falSessionRef.current;
+      falSessionRef.current = null;
+      falSession?.disconnect();
       const media = localStreamRef.current;
       localStreamRef.current = null;
       media?.getTracks().forEach((track) => track.stop());
@@ -161,9 +249,13 @@ export function LiveStudio() {
     startGenerationRef.current += 1;
     startAbortRef.current?.abort();
     startAbortRef.current = null;
+    clearPublishedSessionRef.current();
     const session = realtimeRef.current;
     realtimeRef.current = null;
     session?.disconnect();
+    const falSession = falSessionRef.current;
+    falSessionRef.current = null;
+    falSession?.disconnect();
     const media = localStreamRef.current;
     localStreamRef.current = null;
     media?.getTracks().forEach((track) => track.stop());
@@ -171,14 +263,16 @@ export function LiveStudio() {
     if (outputVideoRef.current) outputVideoRef.current.srcObject = null;
     setSessionState("idle");
     setSessionSeconds(0);
-    setObsUrl(null);
     setReferenceApplied(false);
   }, []);
 
   const startSession = useCallback(async () => {
     if (busy || sessionState === "connected" || sessionState === "connecting") return;
     if (!serverStatus?.configured) {
-      setError("Add DECART_API_KEY and APP_ORIGINS to the server environment before starting a live session.");
+      const missing = serverStatus?.missing?.length
+        ? serverStatus.missing.join(" and ")
+        : "the required provider credentials and APP_ORIGINS";
+      setError(`Add ${missing} to the server environment before starting a live session.`);
       return;
     }
     if (!mountedRef.current) return;
@@ -192,11 +286,11 @@ export function LiveStudio() {
       if (localStreamRef.current === media) localStreamRef.current = null;
       if (localVideoRef.current?.srcObject === media) localVideoRef.current.srcObject = null;
     };
+    const provider = serverStatus.provider === "fal" ? "fal" : "decart";
 
     setBusy(true);
     setError(null);
     setSessionState("connecting");
-    setObsUrl(null);
     const modelName = modelForMode(mode);
 
     try {
@@ -221,6 +315,39 @@ export function LiveStudio() {
       await refreshCameras();
       if (!isCurrentAttempt()) {
         disposePendingMedia(media);
+        return;
+      }
+
+      if (provider === "fal") {
+        const falSession = await connectFalLucySession({
+          mode,
+          media,
+          reference,
+          signal: abortController.signal,
+          onRemoteStream: attachOutput,
+          onConnected: () => {
+            if (!mountedRef.current || !isCurrentAttempt()) return;
+            setSessionState("connected");
+          },
+          onGenerationStarted: () => {
+            if (!mountedRef.current || !isCurrentAttempt()) return;
+            setSessionState("generating");
+          },
+          onError: (message) => {
+            if (!mountedRef.current || !isCurrentAttempt()) return;
+            stopSession();
+            setSessionState("error");
+            setError(message);
+          },
+        });
+        if (!isCurrentAttempt()) {
+          falSession.disconnect();
+          disposePendingMedia(media);
+          return;
+        }
+        falSessionRef.current = falSession;
+        setSessionSeconds(0);
+        setReferenceApplied(Boolean(reference));
         return;
       }
 
@@ -258,14 +385,23 @@ export function LiveStudio() {
         return;
       }
       realtimeRef.current = realtime;
+      const sessionId = crypto.randomUUID();
+      obsSessionIdRef.current = sessionId;
+      obsModelRef.current = modelName;
       setSessionState(realtime.getConnectionState() as SessionState);
       setSessionSeconds(0);
       setReferenceApplied(Boolean(reference));
 
-      const syncViewerLink = () => {
-        if (realtime.subscribeToken) setObsUrl(buildViewerUrl(realtime.subscribeToken, modelName));
+      const publishViewer = () => {
+        const subscribeToken = realtime.subscribeToken;
+        if (!subscribeToken) return;
+        void publishObsSession(sessionId, subscribeToken, modelName).then((published) => {
+          if (!published && mountedRef.current && realtimeRef.current === realtime) {
+            setError("The live video is running here, but the OBS page could not be updated.");
+          }
+        });
       };
-      syncViewerLink();
+      publishViewer();
       realtime.on("connectionChange", (state) => {
         if (!mountedRef.current || realtimeRef.current !== realtime) return;
         if (state === "disconnected") {
@@ -275,7 +411,7 @@ export function LiveStudio() {
           return;
         }
         setSessionState(state as SessionState);
-        syncViewerLink();
+        publishViewer();
       });
       realtime.on("generationTick", ({ seconds }) => {
         if (mountedRef.current && realtimeRef.current === realtime) setSessionSeconds(seconds);
@@ -302,13 +438,19 @@ export function LiveStudio() {
       if (startAbortRef.current === abortController) startAbortRef.current = null;
       if (mountedRef.current) setBusy(false);
     }
-  }, [attachOutput, busy, cameraId, mode, microphoneOn, refreshCameras, reference, serverStatus, sessionState, stopSession]);
+  }, [attachOutput, busy, cameraId, mode, microphoneOn, publishObsSession, refreshCameras, reference, serverStatus, sessionState, stopSession]);
 
   const applyReference = async () => {
     if (!reference || referenceBusy) return;
     setReferenceBusy(true);
     setError(null);
     try {
+      const falSession = falSessionRef.current;
+      if (falSession) {
+        await falSession.setImage(reference);
+        if (mountedRef.current && falSessionRef.current === falSession) setReferenceApplied(true);
+        return;
+      }
       const session = realtimeRef.current;
       if (session) {
         await session.setImage(reference);
@@ -326,7 +468,8 @@ export function LiveStudio() {
     setReferenceBusy(true);
     setError(null);
     try {
-      if (realtimeRef.current) await realtimeRef.current.setImage(null);
+      if (falSessionRef.current) await falSessionRef.current.setImage(null);
+      else if (realtimeRef.current) await realtimeRef.current.setImage(null);
       if (!mountedRef.current) return;
       if (referenceUrl) URL.revokeObjectURL(referenceUrl);
       setReference(null);
@@ -339,18 +482,40 @@ export function LiveStudio() {
     }
   };
 
-  const onDrop = (files: File[]) => {
-    const file = files[0];
-    if (!file || referenceBusy || busy) return;
+  const selectReference = useCallback((file: File) => {
+    if (referenceBusy || busy) return;
+    if (!ACCEPTED_IMAGE_TYPES.has(file.type) || file.size > REFERENCE_MAX_BYTES) {
+      setError("Choose a supported image file up to 10 MB.");
+      return;
+    }
     if (referenceUrl) URL.revokeObjectURL(referenceUrl);
     setReference(file);
     setReferenceUrl(URL.createObjectURL(file));
     setReferenceApplied(false);
     setError(null);
+  }, [busy, referenceBusy, referenceUrl]);
+
+  const onDrop = (files: File[]) => {
+    const file = files[0];
+    if (file) selectReference(file);
   };
+
+  useEffect(() => {
+    if (reference) return;
+    const onPaste = (event: ClipboardEvent) => {
+      if (isTextEntry(event.target)) return;
+      const file = imageFileFromClipboard(event.clipboardData);
+      if (!file) return;
+      event.preventDefault();
+      selectReference(file);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [reference, selectReference]);
 
   const connected = sessionState === "connected" || sessionState === "generating" || sessionState === "reconnecting";
   const currentMode = REALTIME_MODES.find((item) => item.id === mode) ?? REALTIME_MODES[0];
+  const liveProvider = serverStatus?.provider === "fal" ? "fal" : "decart";
   const cameraOptions = cameras.map((device, index) => ({
     value: device.deviceId,
     label: device.label || `Camera ${index + 1}`,
@@ -363,7 +528,7 @@ export function LiveStudio() {
           <Box className="brand-glyph"><IconAperture size={20} stroke={1.8} /></Box>
           <Box>
             <Text className="brand-title">LiveBridge</Text>
-            <Text className="brand-subtitle">Decart live studio</Text>
+            <Text className="brand-subtitle">{liveProvider === "fal" ? "FAL Lucy studio" : "Decart live studio"}</Text>
           </Box>
         </Group>
         <Group gap="md" className="header-meta">
@@ -378,9 +543,15 @@ export function LiveStudio() {
           <Group className="page-heading" align="flex-end">
             <Box>
               <Title order={1}>Live studio</Title>
-              <Text>Choose a reference image, connect your camera, and send the transformed feed to OBS.</Text>
+              <Text>
+                {liveProvider === "fal"
+                  ? "Choose a reference image, connect your camera, and preview the FAL Lucy transform here."
+                  : "Choose a reference image, connect your camera, and send the transformed feed to OBS."}
+              </Text>
             </Box>
-            <Badge variant="outline" color="gray" leftSection={<IconAperture size={13} />}>Decart-hosted inference</Badge>
+            <Badge variant="outline" color="gray" leftSection={<IconAperture size={13} />}>
+              {liveProvider === "fal" ? "FAL-hosted Lucy inference" : "Decart-hosted inference"}
+            </Badge>
           </Group>
 
           {serverStatus && !serverStatus.configured && (
@@ -396,25 +567,44 @@ export function LiveStudio() {
           )}
 
           <div className="studio-layout">
-            <div className="studio-main-column">
-              <Paper className="panel" radius="lg" p="md">
+            <Paper className="panel preview-panel" radius="lg" p="md">
                 <Group justify="space-between" mb="sm" wrap="wrap">
                   <Group gap="xs">
                     <Text className="panel-title">Live preview</Text>
                     <Text className="panel-kicker">Your input and transformed output</Text>
                   </Group>
-                  <Text className="mono-meta">{connected ? `SESSION ${formatDuration(sessionSeconds)}` : "CAMERA NOT CONNECTED"}</Text>
+                  <Group gap="xs" align="center">
+                    <Text className="mono-meta">{connected ? `SESSION ${formatDuration(sessionSeconds)}` : "CAMERA NOT CONNECTED"}</Text>
+                    <Tooltip label={pipLayout ? "Show side-by-side" : "Picture-in-picture"}>
+                      <ActionIcon
+                        variant={pipLayout ? "filled" : "default"}
+                        color={pipLayout ? "teal" : "gray"}
+                        size="sm"
+                        aria-label={pipLayout ? "Show side-by-side preview" : "Show picture-in-picture preview"}
+                        aria-pressed={pipLayout}
+                        onClick={() => setPipLayout((current) => !current)}
+                      >
+                        {pipLayout ? <IconLayoutColumns size={16} /> : <IconPictureInPicture size={16} />}
+                      </ActionIcon>
+                    </Tooltip>
+                  </Group>
                 </Group>
-                <div className="video-pair">
-                  <div className="video-frame">
+                <div className={`video-pair${pipLayout ? " is-pip" : ""}`}>
+                  <div className="video-frame video-frame-camera">
                     <div className="video-label"><IconCamera size={12} /> Camera input</div>
                     <video ref={localVideoRef} muted autoPlay playsInline />
                     {!connected && <VideoPlaceholder icon={<IconCamera size={24} />} title="Camera preview" detail="Select a camera, then start the live transformation." />}
                   </div>
-                  <div className="video-frame">
+                  <div className="video-frame video-frame-output">
                     <div className="video-label"><span className={`status-led ${connected ? "is-live" : ""}`} /> Transformed output</div>
                     <video ref={outputVideoRef} autoPlay playsInline />
-                    {!connected && <VideoPlaceholder icon={<IconAperture size={24} />} title="Output will appear here" detail="The Decart stream appears after the connection is ready." />}
+                    {!connected && (
+                      <VideoPlaceholder
+                        icon={<IconAperture size={24} />}
+                        title="Output will appear here"
+                        detail={liveProvider === "fal" ? "The FAL Lucy stream appears after the connection is ready." : "The Decart stream appears after the connection is ready."}
+                      />
+                    )}
                   </div>
                 </div>
                 <Divider my="md" color="dark.5" />
@@ -455,27 +645,7 @@ export function LiveStudio() {
                 </Group>
               </Paper>
 
-              <Paper className="panel" radius="lg" p="md">
-                <Group justify="space-between" align="flex-start" mb="sm" wrap="wrap">
-                  <Box>
-                    <Text className="panel-title">Live mode</Text>
-                    <Text className="panel-kicker" mt={4}>{currentMode.detail}</Text>
-                  </Box>
-                  <Badge color="teal" variant="light">Image guided</Badge>
-                </Group>
-                <SegmentedControl
-                  className="mode-selector"
-                  fullWidth
-                  value={mode}
-                  onChange={(value) => setMode(value as RealtimeMode)}
-                  disabled={connected || sessionState === "connecting"}
-                  data={REALTIME_MODES.map((item) => ({ value: item.id, label: item.label }))}
-                />
-                <Text className="panel-kicker" mt="xs">Choose the mode before connecting. No text prompt is needed in this studio.</Text>
-              </Paper>
-            </div>
-
-            <div className="studio-side-column">
+            <div className="studio-main-column">
               <Paper className="panel" radius="lg" p="md">
                 <Group justify="space-between" align="flex-start" mb="sm">
                   <Box>
@@ -498,8 +668,8 @@ export function LiveStudio() {
                   >
                     <div className="reference-empty">
                       <IconUpload size={23} color="var(--lb-accent)" />
-                      <Text size="sm" fw={600}>Drop an image or browse</Text>
-                      <Text size="xs" c="dimmed">PNG, JPEG, WebP and other common formats · up to 10 MB</Text>
+                      <Text size="sm" fw={600}>Drop, paste, or browse an image</Text>
+                      <Text size="xs" c="dimmed">PNG, JPEG, WebP and other common formats · up to 10 MB · Ctrl+V</Text>
                     </div>
                   </Dropzone>
                 ) : (
@@ -547,35 +717,59 @@ export function LiveStudio() {
                   {referenceBusy ? "Updating the live reference…" : connected ? referenceApplied ? "This image is guiding the active session." : "Preview the replacement, then apply it to change the live look." : "The selected image is sent only when the next live session starts."}
                 </Text>
               </Paper>
+            </div>
+
+            <div className="studio-side-column">
+              <Paper className="panel" radius="lg" p="md">
+                <Group justify="space-between" align="flex-start" mb="sm" wrap="wrap">
+                  <Box>
+                    <Text className="panel-title">Live mode</Text>
+                    <Text className="panel-kicker" mt={4}>{currentMode.detail}</Text>
+                  </Box>
+                  <Badge color="teal" variant="light">Image guided</Badge>
+                </Group>
+                <SegmentedControl
+                  className="mode-selector"
+                  fullWidth
+                  value={mode}
+                  onChange={(value) => setMode(value as RealtimeMode)}
+                  disabled={connected || sessionState === "connecting"}
+                  data={REALTIME_MODES.map((item) => ({ value: item.id, label: item.label }))}
+                />
+                <Text className="panel-kicker" mt="xs">
+                  {liveProvider === "fal"
+                    ? "Choose the mode before connecting. FAL uses a built-in prompt per mode plus your reference image."
+                    : "Choose the mode before connecting. No text prompt is needed in this studio."}
+                </Text>
+              </Paper>
 
               <Paper className="panel" radius="lg" p="md">
                 <Group justify="space-between" mb="xs">
                   <Box>
-                    <Text className="panel-title">OBS output</Text>
-                    <Text className="panel-kicker" mt={4}>Clean viewer page for a Browser Source</Text>
+                    <Text className="panel-title">Your OBS link</Text>
+                    <Text className="panel-kicker" mt={4}>One Browser Source for the AI video</Text>
                   </Box>
                   <IconExternalLink size={18} color="var(--lb-accent)" />
                 </Group>
-                {obsUrl ? (
+                {liveProvider === "fal" ? (
+                  <Alert color="yellow" variant="light" icon={<IconAperture size={16} />}>
+                    <Text size="xs">OBS Browser Source is Decart-only for now. With LIVE_PROVIDER=fal, live preview works in this studio, but the OBS page is not updated.</Text>
+                  </Alert>
+                ) : obsUrl ? (
                   <Stack gap="xs">
                     <Text className="obs-url">{obsUrl}</Text>
-                    <Group grow gap="xs">
-                      <CopyButton value={obsUrl} timeout={1800}>
-                        {({ copied, copy }) => (
-                          <Button onClick={copy} size="xs" variant={copied ? "light" : "filled"} color={copied ? "teal" : "teal"} leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}>
-                            {copied ? "Copied" : "Copy OBS link"}
-                          </Button>
-                        )}
-                      </CopyButton>
-                      <Button component="a" href={obsUrl} target="_blank" rel="noreferrer" size="xs" variant="default" rightSection={<IconExternalLink size={14} />}>
-                        Open
-                      </Button>
-                    </Group>
-                    <Text className="panel-kicker">In OBS: add a Browser Source and paste the copied URL. This is not an RTMP/SRT endpoint.</Text>
+                    <CopyButton value={obsUrl} timeout={1800}>
+                      {({ copied, copy }) => (
+                        <Button onClick={copy} size="xs" variant={copied ? "light" : "filled"} color={copied ? "teal" : "teal"} leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}>
+                          {copied ? "Copied" : "Copy"}
+                        </Button>
+                      )}
+                    </CopyButton>
+                    <Text className="panel-kicker">Paste this into OBS once as a Browser Source at 1920×1080. Leave this studio page open while you are live. Opening the OBS link in this same tab ends the call.</Text>
                   </Stack>
                 ) : (
                   <Alert color="gray" variant="light" icon={<IconAperture size={16} />}>
-                    <Text size="xs">Start a live session to create its private viewer link. It works only while this session is active.</Text>
+                    <Text size="xs">The OBS link is not available yet. Set OBS_KEY and add this site to APP_ORIGINS.</Text>
                   </Alert>
                 )}
               </Paper>
@@ -594,7 +788,11 @@ export function LiveStudio() {
               </Paper>
             </div>
           </div>
-          <Text className="footer-note">Live video is processed by Decart. This app hosts the controls; it does not run Decart models locally. Keep a publicly reachable deployment behind owner access control to protect billable token creation.</Text>
+          <Text className="footer-note">
+            {liveProvider === "fal"
+              ? "Live video is processed through FAL (Decart Lucy). This app hosts the controls; it does not run models locally. Permanent FAL_KEY stays on the server. OBS output is not available on the FAL provider yet."
+              : "Live video is processed by Decart. This app hosts the controls; it does not run Decart models locally. Keep a publicly reachable deployment behind owner access control to protect billable token creation."}
+          </Text>
         </Container>
       </AppShell.Main>
     </AppShell>

@@ -56,7 +56,9 @@ export async function POST(request: Request) {
       { clientToken: token.apiKey, expiresAt: token.expiresAt, model: body.model },
       { headers: { "Cache-Control": "no-store" } },
     );
-  } catch {
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unknown token error";
+    console.error("Decart client token request failed:", detail);
     return NextResponse.json(
       { error: "Could not create a Decart client token. Check the server key and Decart account." },
       { status: 502, headers: { "Cache-Control": "no-store" } },

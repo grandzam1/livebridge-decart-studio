@@ -1,5 +1,14 @@
 import "server-only";
 
+import type { LiveProvider } from "@/lib/live-provider";
+
+export type { LiveProvider };
+
+export function getLiveProvider(): LiveProvider {
+  const raw = process.env.LIVE_PROVIDER?.trim().toLowerCase();
+  return raw === "fal" ? "fal" : "decart";
+}
+
 export function getConfiguredAppOrigins(): string[] {
   const configured = process.env.APP_ORIGINS ?? "";
   const origins = new Set<string>();
@@ -29,9 +38,19 @@ export function getConfiguredAppOrigins(): string[] {
   return [...origins];
 }
 
+export function isAllowedRequestOrigin(request: Request) {
+  const origin = request.headers.get("origin");
+  return Boolean(origin && getConfiguredAppOrigins().includes(origin));
+}
+
 export function getServerConfigurationStatus() {
+  const provider = getLiveProvider();
   const missing: string[] = [];
-  if (!process.env.DECART_API_KEY?.trim()) missing.push("DECART_API_KEY");
+  if (provider === "fal") {
+    if (!process.env.FAL_KEY?.trim()) missing.push("FAL_KEY");
+  } else if (!process.env.DECART_API_KEY?.trim()) {
+    missing.push("DECART_API_KEY");
+  }
   if (getConfiguredAppOrigins().length === 0) missing.push("APP_ORIGINS");
-  return { configured: missing.length === 0, missing };
+  return { configured: missing.length === 0, missing, provider };
 }

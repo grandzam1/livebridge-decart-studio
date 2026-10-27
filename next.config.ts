@@ -1,9 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  experimental: {
+    mcpServer: false,
+  },
   allowedDevOrigins: [
-    "3000-iejufxdxnirgrjbr8yx2y-6c0ec8f5.us1.manus.computer",
-    "8328-iejufxdxnirgrjbr8yx2y-6c0ec8f5.us1.manus.computer",
+    "127.0.0.1",
+    "localhost",
+    "timid-flint-mutt.ngrok-free.dev",
   ],
 };
 

@@ -5,9 +5,20 @@ A small Next.js UI for live camera transformation through Decart, with direct im
 ## Run locally
 
 1. Install Node.js 22+ and pnpm 11.25.0.
-2. Copy `.env.example` to `.env.local` and set the permanent `DECART_API_KEY` plus `APP_ORIGINS=http://localhost:3000`.
+2. Copy `.env.example` to `.env.local` and set `APP_ORIGINS=http://localhost:3000` plus the key for your provider (see below).
 3. Run `pnpm install`, then `pnpm dev`.
 4. Open `http://localhost:3000`, allow camera access, choose a live mode, optionally add a reference image, and click **Start live**.
+
+### Live providers
+
+| `LIVE_PROVIDER` | Required key | Studio preview | OBS Browser Source |
+| --- | --- | --- | --- |
+| `decart` (default) | `DECART_API_KEY` | Yes (`@decartai/sdk`) | Yes |
+| `fal` | `FAL_KEY` | Yes (Lucy via `@fal-ai/client`) | Not yet |
+
+To use FAL Lucy without touching Decart credentials: set `LIVE_PROVIDER=fal`, set `FAL_KEY` from the [fal dashboard](https://fal.ai/dashboard/keys), keep `APP_ORIGINS`, and restart the server. Switch back with `LIVE_PROVIDER=decart` (or omit it).
+
+On FAL, Character/Restyle use `decart/lucy-2-5/realtime` and Try-on uses `decart/lucy2-vton/realtime`. Built-in prompts are sent per mode; your reference image maps to `reference_image_url`. The permanent `FAL_KEY` stays server-side; the browser only receives short-lived realtime JWTs from `/api/fal/realtime-token`.
 
 `APP_ORIGINS` is a comma-separated allowlist of exact origins (`scheme://host[:port]`, no path or trailing slash). Add each trusted browser origin explicitly. The server checks the request's `Origin` header against this fixed configuration and does not trust client-supplied forwarded-host/protocol headers. The initial studio remains available when server settings are missing, shows the missing variable names, and disables live start until setup is complete.
 
@@ -19,7 +30,7 @@ Choose a supported image to preview it locally. It is included when a new live s
 
 ## OBS output
 
-Once the live session is connected, copy the link under **OBS output**. In OBS, add **Sources → Browser**, paste the viewer URL, and set its width and height to match the stream canvas. The URL opens the app's output-only `/obs` viewer. It is a web page for OBS Browser Source, not a raw RTMP/SRT endpoint. Treat the copied URL as a private capability; it stops working when the live session ends.
+With `OBS_KEY=zam`, the OBS link is `http://localhost:3000/obs?key=zam`. Add that URL once as an OBS Browser Source at the canvas size. The page stays blank until you press **Start live**, then it shows only the AI video. A different key stays blank. Stopping the session makes the page blank again. The current session token is kept in memory for this server process. The URL is a web page for OBS Browser Source, not a raw RTMP/SRT endpoint.
 
 ## Scope and security
 
