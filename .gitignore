@@ -3,6 +3,7 @@ node_modules/
 .turbo/
 out/
 coverage/
+.worktrees/
 .env*
 !.env.example
 .DS_Store
