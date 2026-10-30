@@ -1,67 +1,42 @@
 import { createDecartClient } from "@decartai/sdk";
 import { NextResponse } from "next/server";
-import { isRealtimeModelName } from "@/lib/decart";
-import { getConfiguredAppOrigins, getServerConfigurationStatus } from "@/lib/server-config";
+import { jsonError, jsonOk, missingConfig, readJson, requireOrigin } from "@/lib/api";
+import { getDecartApiKey, publicConfig } from "@/lib/config";
+import { REALTIME_MODES, isRealtimeModelName } from "@/lib/decart";
+import { upstreamErrorResponse, withTimeout } from "@/lib/upstream";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  const configuration = getServerConfigurationStatus();
-  if (!configuration.configured) {
-    return NextResponse.json(
-      {
-        error: `Decart is not configured. Set ${configuration.missing.join(" and ")} in the server environment.`,
-      },
-      { status: 503, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const secret = getDecartApiKey();
+  if (!secret) return missingConfig(["DECART_API_KEY"]);
 
-  const secret = process.env.DECART_API_KEY;
-  const allowedOrigins = getConfiguredAppOrigins();
-  const origin = request.headers.get("origin");
-  if (!origin || !allowedOrigins.includes(origin)) {
-    return NextResponse.json(
-      { error: "Token requests must come from a configured app origin." },
-      { status: 403, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const allowed = requireOrigin(request);
+  if (allowed instanceof NextResponse) return allowed;
 
-  let body: { model?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json(
-      { error: "Invalid request body." },
-      { status: 400, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const body = await readJson<{ model: unknown }>(request);
+  if (body instanceof NextResponse) return body;
 
   if (!isRealtimeModelName(body.model)) {
-    return NextResponse.json(
-      { error: "Unsupported realtime model." },
-      { status: 400, headers: { "Cache-Control": "no-store" } },
+    return jsonError(
+      400,
+      "UNSUPPORTED_MODEL",
+      "Unsupported realtime model.",
+      `Use a model from livebridge.config.ts: ${REALTIME_MODES.map((mode) => mode.decartModel).join(", ")}.`,
     );
   }
 
   try {
     const client = createDecartClient({ apiKey: secret, telemetry: false });
-    const token = await client.tokens.create({
-      expiresIn: 300,
+    const token = await withTimeout(client.tokens.create({
+      expiresIn: publicConfig.tokens.decartTtlSeconds,
       allowedModels: [body.model],
-      allowedOrigins: [origin],
-    });
+      allowedOrigins: [allowed.origin],
+    }));
 
-    return NextResponse.json(
-      { clientToken: token.apiKey, expiresAt: token.expiresAt, model: body.model },
-      { headers: { "Cache-Control": "no-store" } },
-    );
+    return jsonOk({ clientToken: token.apiKey, expiresAt: token.expiresAt, model: body.model });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : "Unknown token error";
-    console.error("Decart client token request failed:", detail);
-    return NextResponse.json(
-      { error: "Could not create a Decart client token. Check the server key and Decart account." },
-      { status: 502, headers: { "Cache-Control": "no-store" } },
-    );
+    return upstreamErrorResponse({ name: "Decart", keyName: "DECART_API_KEY" }, error);
   }
 }

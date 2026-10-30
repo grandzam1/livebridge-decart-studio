@@ -1,64 +1,30 @@
 import { NextResponse } from "next/server";
+import { jsonError, jsonOk, missingConfig, readJson, requireOrigin } from "@/lib/api";
+import { getFalKey, getLiveProvider, publicConfig } from "@/lib/config";
 import { FAL_LUCY_APPS, isFalLucyApp } from "@/lib/fal-models";
-import { getLiveProvider, getConfiguredAppOrigins, getServerConfigurationStatus } from "@/lib/server-config";
+import { UPSTREAM_TIMEOUT_MS, UpstreamHttpError, upstreamErrorResponse } from "@/lib/upstream";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const TOKEN_DURATION_SECONDS = 120;
+const TOKEN_DURATION_SECONDS = publicConfig.tokens.falTtlSeconds;
 
 export async function POST(request: Request) {
   if (getLiveProvider() !== "fal") {
-    return NextResponse.json(
-      { error: "FAL is not the active live provider. Set LIVE_PROVIDER=fal to use this endpoint." },
-      { status: 503, headers: { "Cache-Control": "no-store" } },
-    );
+    return jsonError(503, "PROVIDER_INACTIVE", "FAL is not the active live provider.", "Set LIVE_PROVIDER=fal in .env and restart the server.");
   }
 
-  const configuration = getServerConfigurationStatus();
-  if (!configuration.configured) {
-    return NextResponse.json(
-      {
-        error: `FAL is not configured. Set ${configuration.missing.join(" and ")} in the server environment.`,
-      },
-      { status: 503, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const falKey = getFalKey();
+  if (!falKey) return missingConfig(["FAL_KEY"]);
 
-  const falKey = process.env.FAL_KEY?.trim();
-  if (!falKey) {
-    return NextResponse.json(
-      { error: "FAL_KEY is not configured." },
-      { status: 503, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const allowed = requireOrigin(request);
+  if (allowed instanceof NextResponse) return allowed;
 
-  const allowedOrigins = getConfiguredAppOrigins();
-  const origin = request.headers.get("origin");
-  if (!origin || !allowedOrigins.includes(origin)) {
-    return NextResponse.json(
-      { error: "Token requests must come from a configured app origin." },
-      { status: 403, headers: { "Cache-Control": "no-store" } },
-    );
-  }
-
-  let body: { app?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json(
-      { error: "Invalid request body." },
-      { status: 400, headers: { "Cache-Control": "no-store" } },
-    );
-  }
+  const body = await readJson<{ app: unknown }>(request);
+  if (body instanceof NextResponse) return body;
 
   if (!isFalLucyApp(body.app)) {
-    return NextResponse.json(
-      {
-        error: `Unsupported FAL app. Allowed: ${FAL_LUCY_APPS.edit}, ${FAL_LUCY_APPS.vton}.`,
-      },
-      { status: 400, headers: { "Cache-Control": "no-store" } },
-    );
+    return jsonError(400, "UNSUPPORTED_MODEL", "Unsupported FAL app.", `Allowed: ${Object.values(FAL_LUCY_APPS).join(", ")}.`);
   }
 
   try {
@@ -69,31 +35,30 @@ export async function POST(request: Request) {
         Authorization: `Key ${falKey}`,
       },
       body: JSON.stringify({
+        app: body.app,
         allowed_apps: [body.app],
         duration: TOKEN_DURATION_SECONDS,
       }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
 
-    const payload = await response.json() as { token?: string; detail?: string; message?: string };
-    if (!response.ok || !payload.token) {
-      const detail = payload.detail ?? payload.message ?? `HTTP ${response.status}`;
-      console.error("FAL realtime token request failed:", detail);
-      return NextResponse.json(
-        { error: "Could not create a FAL realtime token. Check FAL_KEY and account access." },
-        { status: 502, headers: { "Cache-Control": "no-store" } },
-      );
+    // FAL may answer with an HTML error page during outages, so only parse JSON when it is JSON.
+    const isJson = response.headers.get("content-type")?.includes("application/json") ?? false;
+    const payload = isJson
+      ? await response.json().catch(() => null) as { token?: string; detail?: unknown; message?: unknown } | string | null
+      : null;
+    if (!response.ok) {
+      const detail = payload ? JSON.stringify(typeof payload === "object" ? (payload.detail ?? payload.message ?? payload) : payload) : await response.text().catch(() => "");
+      throw new UpstreamHttpError(response.status, detail || `HTTP ${response.status}`);
+    }
+    // FAL returns the JWT either as a bare JSON string or wrapped as { token }.
+    const token = typeof payload === "string" ? payload : payload?.token;
+    if (typeof token !== "string" || !token) {
+      throw new Error(`FAL returned HTTP ${response.status} without a token (content-type: ${response.headers.get("content-type") ?? "none"}).`);
     }
 
-    return NextResponse.json(
-      { token: payload.token, expiresIn: TOKEN_DURATION_SECONDS, app: body.app },
-      { headers: { "Cache-Control": "no-store" } },
-    );
+    return jsonOk({ token, expiresIn: TOKEN_DURATION_SECONDS, app: body.app });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : "Unknown token error";
-    console.error("FAL realtime token request failed:", detail);
-    return NextResponse.json(
-      { error: "Could not create a FAL realtime token. Check FAL_KEY and network access." },
-      { status: 502, headers: { "Cache-Control": "no-store" } },
-    );
+    return upstreamErrorResponse({ name: "FAL", keyName: "FAL_KEY" }, error);
   }
 }

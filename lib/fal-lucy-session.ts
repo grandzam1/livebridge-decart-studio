@@ -1,8 +1,10 @@
 "use client";
 
 import { fal } from "@fal-ai/client";
+import { fetchJson, toErrorView, type ErrorView } from "@/lib/api-client";
 import type { RealtimeMode } from "@/lib/decart";
 import { falAppForMode, falPromptForMode, type FalLucyApp } from "@/lib/fal-models";
+import { publicConfig } from "@/lib/public-config";
 
 type FalRealtimeConnection = {
   send: (payload: Record<string, unknown>) => void;
@@ -41,7 +43,7 @@ export type ConnectFalLucyOptions = {
   media: MediaStream;
   reference?: File | null;
   onRemoteStream: (stream: MediaStream) => void;
-  onError: (message: string) => void;
+  onError: (error: string | ErrorView) => void;
   onConnected: () => void;
   onGenerationStarted?: () => void;
   signal?: AbortSignal;
@@ -71,23 +73,20 @@ async function fileToDataUri(file: File): Promise<string> {
 }
 
 async function fetchFalToken(app: FalLucyApp, signal?: AbortSignal): Promise<string> {
-  const response = await fetch("/api/fal/realtime-token", {
+  const payload = await fetchJson<{ token?: string }>("/api/fal/realtime-token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ app }),
-    cache: "no-store",
     signal,
   });
-  const payload = await response.json() as { token?: string; error?: string };
-  if (!response.ok || !payload.token) {
-    throw new Error(payload.error ?? "Could not get a short-lived FAL session token.");
-  }
+  if (!payload.token) throw new Error("Could not get a short-lived FAL session token.");
   return payload.token;
 }
 
 /**
- * Opens a FAL Lucy realtime WebRTC session for studio preview only.
- * OBS subscribe is not supported on this path.
+ * Opens a FAL Lucy realtime WebRTC session for studio preview.
+ * FAL exposes no viewer subscribe token, so the studio page re-publishes the
+ * remote stream to the OBS page through a local peer-to-peer relay (/api/obs/fal).
  */
 export async function connectFalLucySession(options: ConnectFalLucyOptions): Promise<FalLucySession> {
   const app = falAppForMode(options.mode);
@@ -229,12 +228,11 @@ export async function connectFalLucySession(options: ConnectFalLucyOptions): Pro
     connection = fal.realtime.connect(app, {
       connectionKey: `livebridge-fal-${Date.now()}`,
       throttleInterval: 0,
-      tokenExpirationSeconds: 120,
+      tokenExpirationSeconds: publicConfig.tokens.falTtlSeconds,
       tokenProvider: async () => fetchFalToken(app, options.signal),
       onError: (error) => {
         if (disposed) return;
-        const message = error instanceof Error ? error.message : "The FAL session reported an error.";
-        options.onError(message);
+        options.onError(toErrorView(error, "The FAL session reported an error."));
         cleanup();
       },
       onResult: (raw) => {

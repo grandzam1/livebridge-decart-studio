@@ -1,10 +1,9 @@
-import { NextResponse } from "next/server";
+import { jsonError, jsonOk } from "@/lib/api";
 import { readObsViewer } from "@/lib/obs-state";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const noStore = { "Cache-Control": "no-store" };
 const windowMs = 10_000;
 const requestLimit = 30;
 const recentRequests: number[] = [];
@@ -19,20 +18,17 @@ function allowStatusRequest() {
 
 export async function GET(request: Request) {
   if (!allowStatusRequest()) {
-    return NextResponse.json(
-      { error: "Too many OBS viewer checks." },
-      { status: 429, headers: { ...noStore, "Retry-After": "2" } },
-    );
+    return jsonError(429, "RATE_LIMITED", "Too many OBS viewer checks.", "Wait a few seconds; the viewer retries automatically.", { "Retry-After": "2" });
   }
 
   const viewKey = new URL(request.url).searchParams.get("key") ?? "";
   if (viewKey.length === 0 || viewKey.length > 128) {
-    return NextResponse.json({ live: false }, { headers: noStore });
+    return jsonOk({ live: false });
   }
 
   try {
-    return NextResponse.json(await readObsViewer(viewKey), { headers: noStore });
+    return jsonOk(readObsViewer(viewKey));
   } catch {
-    return NextResponse.json({ live: false }, { headers: noStore });
+    return jsonOk({ live: false });
   }
 }

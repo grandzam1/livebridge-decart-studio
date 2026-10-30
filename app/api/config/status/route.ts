@@ -1,11 +1,9 @@
-import { NextResponse } from "next/server";
-import { getServerConfigurationStatus } from "@/lib/server-config";
+import { jsonOk } from "@/lib/api";
+import { getServerConfigurationStatus } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return NextResponse.json(getServerConfigurationStatus(), {
-    headers: { "Cache-Control": "no-store" },
-  });
+  return jsonOk(getServerConfigurationStatus());
 }

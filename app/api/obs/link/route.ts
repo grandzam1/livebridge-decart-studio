@@ -1,24 +1,16 @@
 import { NextResponse } from "next/server";
-import { getObsViewKey } from "@/lib/obs-state";
-import { isAllowedRequestOrigin } from "@/lib/server-config";
+import { jsonOk, missingConfig, requireOrigin } from "@/lib/api";
+import { getObsViewKey } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const noStore = { "Cache-Control": "no-store" };
-
 export async function POST(request: Request) {
-  if (!isAllowedRequestOrigin(request)) {
-    return NextResponse.json(
-      { error: "OBS link requests must come from a configured app origin." },
-      { status: 403, headers: noStore },
-    );
-  }
+  const allowed = requireOrigin(request);
+  if (allowed instanceof NextResponse) return allowed;
 
   const viewKey = getObsViewKey();
-  if (!viewKey) {
-    return NextResponse.json({ error: "Set OBS_KEY in the server environment." }, { status: 503, headers: noStore });
-  }
+  if (!viewKey) return missingConfig(["OBS_KEY"]);
 
-  return NextResponse.json({ viewKey }, { headers: noStore });
+  return jsonOk({ viewKey });
 }

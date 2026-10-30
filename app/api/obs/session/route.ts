@@ -1,34 +1,24 @@
 import { NextResponse } from "next/server";
+import { jsonError, noContent, readJson, requireOrigin } from "@/lib/api";
 import { isRealtimeModelName, type RealtimeModelName } from "@/lib/decart";
 import { publishObsSession } from "@/lib/obs-state";
-import { isAllowedRequestOrigin } from "@/lib/server-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const noStore = { "Cache-Control": "no-store" };
 
 function isSessionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9-]{16,80}$/.test(value);
 }
 
 export async function POST(request: Request) {
-  if (!isAllowedRequestOrigin(request)) {
-    return NextResponse.json(
-      { error: "Live session updates must come from a configured app origin." },
-      { status: 403, headers: noStore },
-    );
-  }
+  const allowed = requireOrigin(request);
+  if (allowed instanceof NextResponse) return allowed;
 
-  let body: { sessionId?: unknown; subscribeToken?: unknown; model?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid request body." }, { status: 400, headers: noStore });
-  }
+  const body = await readJson<{ sessionId: unknown; subscribeToken: unknown; model: unknown }>(request);
+  if (body instanceof NextResponse) return body;
 
   if (!isSessionId(body.sessionId)) {
-    return NextResponse.json({ error: "Invalid session." }, { status: 400, headers: noStore });
+    return jsonError(400, "BAD_REQUEST", "Invalid session id.");
   }
 
   const sessionId = body.sessionId;
@@ -38,13 +28,9 @@ export async function POST(request: Request) {
   } else if (typeof body.subscribeToken === "string" && body.subscribeToken.length > 0 && body.subscribeToken.length <= 4096 && isRealtimeModelName(body.model)) {
     update = { sessionId, subscribeToken: body.subscribeToken, model: body.model };
   } else {
-    return NextResponse.json({ error: "Invalid live session." }, { status: 400, headers: noStore });
+    return jsonError(400, "BAD_REQUEST", "Invalid live session update.");
   }
 
-  try {
-    publishObsSession(update);
-    return new NextResponse(null, { status: 204, headers: noStore });
-  } catch {
-    return NextResponse.json({ error: "The live session could not be saved." }, { status: 500, headers: noStore });
-  }
+  publishObsSession(update);
+  return noContent();
 }
